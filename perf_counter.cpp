@@ -14,29 +14,6 @@
 #include <string.h>
 
 namespace {
-    bool check_okay() {
-        std::ifstream proc_event_paranoid("/proc/sys/kernel/perf_event_paranoid");
-        int n = 2;
-        proc_event_paranoid >> n;
-
-        if (proc_event_paranoid.bad() || n > 0) {
-            std::cerr << "Try tweeking /proc/sys/kernel/perf_event_paranoid - it should be 0 or -1" << std::endl;
-            return false;
-        }
-
-        std::ifstream cpu_rdpmc("/sys/devices/cpu/rdpmc");
-        if (cpu_rdpmc.good()) {
-            cpu_rdpmc >> n;
-
-            if (cpu_rdpmc.bad() || n != 2) {
-                std::cerr << "Try tweeking /sys/devices/cpu/rdpmc - it should be 2" << std::endl;
-                return false;
-            }
-        }
-
-        return true;
-    }
-
     int64_t rdpmc(int64_t c) {
         uint32_t edx, eax;
         asm volatile("rdpmc \n\t"
@@ -79,12 +56,18 @@ namespace {
 #undef HW
 #undef SW
     }
+
+    bool enabled() {
+        std::vector<std::string> str;
+        return PerfCounter::check_config(str);
+    }
 }
 
 template<typename T>
 T do_c_check(T rc, const char * expr, int line) {
     if ((long)rc == -1) {
-        std::cerr << "On line " << line << ", " << expr  << " returned " << strerror(errno) << std::endl;
+        std::cerr <<
+            "On line " << line << ", " << expr  << " returned " << strerror(errno) << std::endl;
     }
 
     return rc;
@@ -92,22 +75,49 @@ T do_c_check(T rc, const char * expr, int line) {
 
 #define c_check(expr) do_c_check((expr), #expr, __LINE__)
 
-PerfCounter::PerfCounter(CpuCounter counter) : _fd(0) {
-    static bool okay = check_okay();
+bool PerfCounter::check_config(std::vector<std::string> &messages) {
+    bool ret = true;
+    std::ifstream proc_event_paranoid("/proc/sys/kernel/perf_event_paranoid");
+    int n = 2;
+    proc_event_paranoid >> n;
 
+    if (proc_event_paranoid.bad() || n > 0) {
+        messages.emplace_back(
+                "Try tweeking /proc/sys/kernel/perf_event_paranoid - "
+                "it should be less than one (0 or -1)");
+        ret = false;
+    }
+
+    std::ifstream cpu_rdpmc("/sys/devices/cpu/rdpmc");
+    if (cpu_rdpmc.good()) {
+        cpu_rdpmc >> n;
+
+        if (cpu_rdpmc.bad() || n != 2) {
+            messages.emplace_back("Try tweeking /sys/devices/cpu/rdpmc - it should be 2");
+            ret = false;
+        }
+    }
+    else {
+        messages.emplace_back(
+                "could not read /sys/devices/cpu/rdpmc - you may need to be root to check");
+    }
+
+    return ret;
+}
+
+PerfCounter::PerfCounter(CpuCounter counter) : _fd(0) {
+    static bool okay = enabled();
 
     _enabled = okay;
     _hardware = counter <= HW_STALLED_CYCLES_BACKEND;
     if (okay) {
-        perf_event_attr pea;
-        bzero(&pea, sizeof(pea));
+        perf_event_attr pea {};
 
         std::tie(pea.type, pea.config) = translate(counter);
         pea.size = sizeof(pea);
         pea.disabled = 1;
-        pea.exclude_kernel = 0;
-        pea.exclude_hv = 0;
 
+        // measure this process on any cpu
         _fd = c_check(perf_event_open(&pea, 0, -1));
         _enabled = okay && _fd != -1;
 
@@ -163,6 +173,11 @@ void PerfCounter::disable() {
 }
 
 PerfCounter::~PerfCounter() {
+    if (_meta) {
+        auto pgsz = sysconf(_SC_PAGESIZE);
+        c_check(munmap(_meta, pgsz));
+    }
+
     if (_enabled) {
 
         ioctl(_fd, PERF_EVENT_IOC_DISABLE);
